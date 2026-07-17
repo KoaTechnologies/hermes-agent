@@ -99,7 +99,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "escalated", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -119,23 +119,73 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
-# ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
-# unblocking them only to have the worker re-block for the same reason.
+# ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``escalated`` if a cron keeps
+# unblocking them only to have the worker re-block for the same fingerprint.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
-# unblocker (usually a cron) and routes the task to ``triage`` instead of back
+# unblocker (usually a cron) and routes the task to ``escalated`` instead of back
 # to ``blocked`` — breaking the infinite unblock↔re-block loop and forcing a
 # human-in-the-loop decision. Mirrors the dispatcher's ``DEFAULT_FAILURE_LIMIT``
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+VALID_ADJUDICATION_STATUSES = {
+    "queued", "running", "decided", "applied", "failed", "needs_human",
+}
+VALID_ADJUDICATION_VERDICTS = {
+    "resume", "wait_dependency", "accept_baseline", "needs_human", "cancel",
+}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+
+def compute_block_fingerprint(
+    kind: Optional[str],
+    reason: Optional[str],
+    *,
+    command: Optional[str] = None,
+    target: Optional[str] = None,
+    phase: Optional[str] = None,
+    error_class: Optional[str] = None,
+    assertion: Optional[str] = None,
+) -> str:
+    """Return a stable, non-secret signature for a concrete block cause.
+
+    The input intentionally remains local: callers store the hash, not a
+    second copy of raw logs. Volatile timestamps, UUID/container ids, absolute
+    paths, ports, and long counters are normalized while useful test targets,
+    HTTP status codes, exception classes, and assertion text remain.
+    """
+    concrete_fields = [
+        f"command={command}" if command else None,
+        f"target={target}" if target else None,
+        f"phase={phase}" if phase else None,
+        f"error_class={error_class}" if error_class else None,
+        f"assertion={assertion}" if assertion else None,
+        f"reason={reason}" if reason else None,
+    ]
+    normalized = "\n".join(value for value in concrete_fields if value)
+    normalized = (normalized or "reason=unspecified").strip().casefold()
+    normalized = re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b", "<uuid>", normalized)
+    normalized = re.sub(r"\b[0-9a-f]{12,64}\b", "<hex>", normalized)
+    normalized = re.sub(
+        r"\b20\d{2}-\d{2}-\d{2}(?:[t ][0-9:.+-]+z?)?\b",
+        "<timestamp>",
+        normalized,
+    )
+    normalized = re.sub(r"(?<![\w.-])/(?:[^\s:]+/)+([^/\s:]+)", r"<path>/\1", normalized)
+    normalized = re.sub(r"\b(?:localhost|127\.0\.0\.1):\d{2,5}\b", "<local-port>", normalized)
+    # Keep three-digit HTTP codes such as 404/500; normalize long counters,
+    # PIDs, ports, and timestamps that otherwise make identical failures drift.
+    normalized = re.sub(r"\b\d{4,}\b", "<n>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    payload = f"{kind or 'generic'}\n{normalized}".encode("utf-8", errors="replace")
+    return hashlib.sha256(payload).hexdigest()[:20]
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -912,6 +962,10 @@ class Task:
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
     block_kind: Optional[str] = None
+    # Stable signature of the concrete block cause. Unlike ``block_kind`` this
+    # distinguishes, for example, an HTTP assertion from a Testcontainers
+    # startup failure even when both are classified as ``transient``.
+    block_fingerprint: Optional[str] = None
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
@@ -994,6 +1048,11 @@ class Task:
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
             ),
+            block_fingerprint=(
+                row["block_fingerprint"]
+                if "block_fingerprint" in keys and row["block_fingerprint"]
+                else None
+            ),
             block_recurrences=(
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
@@ -1059,6 +1118,58 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+        )
+
+
+@dataclass
+class Adjudication:
+    """Durable decision record for one escalated block fingerprint."""
+
+    decision_id: str
+    task_id: str
+    trigger_run_id: Optional[int]
+    trigger_event_id: Optional[int]
+    fingerprint: str
+    block_kind: Optional[str]
+    status: str
+    verdict: Optional[str]
+    evidence: list[str]
+    action: Optional[str]
+    resume_profile: Optional[str]
+    child_task_id: Optional[str]
+    worker_session_id: Optional[str]
+    attempts: int
+    created_at: int
+    updated_at: int
+    applied_at: Optional[int]
+    outcome: Optional[str]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Adjudication":
+        try:
+            raw_evidence = json.loads(row["evidence"]) if row["evidence"] else []
+            evidence = [str(item) for item in raw_evidence] if isinstance(raw_evidence, list) else []
+        except Exception:
+            evidence = []
+        return cls(
+            decision_id=row["decision_id"],
+            task_id=row["task_id"],
+            trigger_run_id=(int(row["trigger_run_id"]) if row["trigger_run_id"] is not None else None),
+            trigger_event_id=(int(row["trigger_event_id"]) if row["trigger_event_id"] is not None else None),
+            fingerprint=row["fingerprint"],
+            block_kind=row["block_kind"],
+            status=row["status"],
+            verdict=row["verdict"],
+            evidence=evidence,
+            action=row["action"],
+            resume_profile=row["resume_profile"],
+            child_task_id=row["child_task_id"],
+            worker_session_id=row["worker_session_id"],
+            attempts=int(row["attempts"] or 0),
+            created_at=int(row["created_at"]),
+            updated_at=int(row["updated_at"]),
+            applied_at=(int(row["applied_at"]) if row["applied_at"] is not None else None),
+            outcome=row["outcome"],
         )
 
 
@@ -1176,9 +1287,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to ``blocked`` for a human. Preserved across unblock so a re-block for
     -- the SAME kind can be recognised as a loop.
     block_kind           TEXT,
+    -- Normalized fingerprint of the concrete blocking cause. Preserved across
+    -- recovery so a different failure in the same broad category receives an
+    -- independent retry budget.
+    block_fingerprint    TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
-    -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
+    -- BLOCK_RECURRENCE_LIMIT the task is routed to ``escalated`` instead of
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
@@ -1238,6 +1353,27 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+CREATE TABLE IF NOT EXISTS task_adjudications (
+    decision_id       TEXT PRIMARY KEY,
+    task_id           TEXT NOT NULL,
+    trigger_run_id    INTEGER,
+    trigger_event_id  INTEGER,
+    fingerprint       TEXT NOT NULL,
+    block_kind        TEXT,
+    status            TEXT NOT NULL,
+    verdict           TEXT,
+    evidence          TEXT,
+    action            TEXT,
+    resume_profile    TEXT,
+    child_task_id     TEXT,
+    worker_session_id TEXT,
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    applied_at        INTEGER,
+    outcome           TEXT
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1279,6 +1415,8 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_adjudications_task     ON task_adjudications(task_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_adjudications_trigger ON task_adjudications(task_id, fingerprint, trigger_event_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -1984,6 +2122,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # generic human blocker — same behaviour they had before the column.
         _add_column_if_missing(conn, "tasks", "block_kind", "block_kind TEXT")
 
+    if "block_fingerprint" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "block_fingerprint", "block_fingerprint TEXT"
+        )
+
     if "block_recurrences" not in cols:
         # Unblock-loop counter. Existing rows start at 0, so the loop breaker
         # only begins counting from the first re-block after this migration.
@@ -2008,6 +2151,24 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    # ``_migrate_add_optional_columns`` is also called directly by legacy
+    # migration tests and by a few repair tools before the full SCHEMA_SQL
+    # pass has created the additive table. Do not make those callers fail
+    # merely because the new table is not present yet; the normal init pass
+    # creates it before this function returns.
+    adjudication_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='task_adjudications'"
+    ).fetchone() is not None
+    if adjudication_table_exists:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_adjudications_task "
+            "ON task_adjudications(task_id, created_at)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_adjudications_trigger "
+            "ON task_adjudications(task_id, fingerprint, trigger_event_id)"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2022,6 +2183,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+    _migrate_block_event_fingerprints(conn)
+    _migrate_block_loop_escalations(conn)
 
     # Each dispatch attempt owns one durable Hermes conversation. Keep this
     # separate from ``tasks.session_id``: that field identifies the session
@@ -2129,6 +2292,156 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+
+
+def _migrate_block_event_fingerprints(conn: sqlite3.Connection) -> None:
+    """Backfill concrete fingerprints and per-cause recurrence on old events.
+
+    Older releases counted only ``block_kind``. Replaying the durable event
+    stream lets a 404 assertion and a Testcontainers startup failure receive
+    independent recovery budgets even when both were called ``transient``.
+    Raw reasons stay in the existing event payload; only the stable hash and
+    per-hash occurrence number are added.
+    """
+    task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    # Some repair callers invoke the additive migrator on a deliberately
+    # skeletal tasks table that has no status column yet. There is no safe
+    # active-state backfill to perform in that shape; defer until SCHEMA_SQL
+    # has supplied the canonical table.
+    if "status" not in task_columns:
+        return
+    rows = conn.execute(
+        "SELECT id, task_id, kind, payload FROM task_events "
+        "WHERE kind IN ('blocked', 'dependency_wait', 'block_loop_detected', 'completed') "
+        "ORDER BY task_id, id"
+    ).fetchall()
+    counts: dict[str, dict[str, int]] = {}
+    latest: dict[str, tuple[str, int]] = {}
+    for row in rows:
+        task_id = str(row["task_id"])
+        # A successful completion is the durable reset boundary for block
+        # recurrence memory. Include it in this replay even though no
+        # fingerprint is written for the completion event.
+        if row["kind"] == "completed":
+            counts.pop(task_id, None)
+            latest.pop(task_id, None)
+            continue
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        fingerprint = str(payload.get("fingerprint") or "").strip()
+        if not fingerprint:
+            fingerprint = compute_block_fingerprint(
+                payload.get("kind"),
+                payload.get("reason"),
+                command=payload.get("command"),
+                target=payload.get("target") or payload.get("spec"),
+                phase=payload.get("phase"),
+                error_class=payload.get("error_class"),
+                assertion=payload.get("assertion"),
+            )
+        per_task = counts.setdefault(task_id, {})
+        occurrence = per_task.get(fingerprint, 0) + 1
+        per_task[fingerprint] = occurrence
+        latest[task_id] = (fingerprint, occurrence)
+        if (
+            payload.get("fingerprint") != fingerprint
+            or payload.get("recurrences") != occurrence
+        ):
+            payload["fingerprint"] = fingerprint
+            payload["recurrences"] = occurrence
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                # Legacy boards may still use TEXT event primary keys;
+                # preserve the value until the drift-rebuild pass can
+                # convert the table to INTEGER AUTOINCREMENT.
+                (json.dumps(payload, ensure_ascii=False), row["id"]),
+            )
+    for task_id, (fingerprint, recurrence) in latest.items():
+        conn.execute(
+            "UPDATE tasks SET block_fingerprint = ?, block_recurrences = ? "
+            "WHERE id = ? AND status IN ('blocked', 'escalated', 'triage', 'todo')",
+            (fingerprint, recurrence, task_id),
+        )
+
+
+def _migrate_block_loop_escalations(conn: sqlite3.Connection) -> None:
+    """Move only legacy loop-breaker triage rows into ``escalated``.
+
+    A normal rough idea has no ``block_loop_detected`` event and is therefore
+    untouched. The status predicate makes the pass idempotent. The latest
+    loop event supplies the best available legacy reason for fingerprinting.
+    """
+    task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "status" not in task_columns:
+        return
+    rows = conn.execute(
+        """
+        SELECT t.id, t.block_kind, t.block_fingerprint,
+               (SELECT e.id FROM task_events e
+                 WHERE e.task_id = t.id AND e.kind = 'block_loop_detected'
+                 ORDER BY e.id DESC LIMIT 1) AS loop_event_id,
+               (SELECT e.payload FROM task_events e
+                 WHERE e.task_id = t.id AND e.kind = 'block_loop_detected'
+                 ORDER BY e.id DESC LIMIT 1) AS loop_payload
+         FROM tasks t
+         WHERE t.status = 'triage'
+           AND EXISTS (
+               SELECT 1 FROM task_events e
+                WHERE e.task_id = t.id AND e.kind = 'block_loop_detected'
+           )
+        """,
+    ).fetchall()
+    now = int(time.time())
+    for row in rows:
+        # A loop is no longer vigente after an explicit status/terminal
+        # transition. A historical block-loop event must not reclassify a
+        # genuine idea that an operator later moved back to triage.
+        loop_event_id = row["loop_event_id"]
+        if loop_event_id is not None:
+            cleared = conn.execute(
+                "SELECT 1 FROM task_events e "
+                "JOIN task_events loop ON loop.id = ? "
+                "WHERE e.task_id = ? AND e.rowid > loop.rowid "
+                "AND e.kind IN ('status', 'completed', 'archived') LIMIT 1",
+                (loop_event_id, row["id"]),
+            ).fetchone()
+            if cleared is not None:
+                continue
+        reason = None
+        try:
+            payload = json.loads(row["loop_payload"]) if row["loop_payload"] else {}
+            if isinstance(payload, dict):
+                reason = payload.get("reason")
+        except Exception:
+            reason = None
+        # ``_migrate_block_event_fingerprints`` runs immediately before this
+        # pass and may already have derived a richer fingerprint from command,
+        # target, phase, and assertion fields. Preserve it instead of
+        # collapsing the legacy event back to a reason-only hash.
+        fingerprint = (
+            str(row["block_fingerprint"]).strip()
+            if row["block_fingerprint"]
+            else compute_block_fingerprint(row["block_kind"], reason)
+        )
+        updated = conn.execute(
+            "UPDATE tasks SET status = 'escalated', block_fingerprint = ? "
+            "WHERE id = ? AND status = 'triage'",
+            (fingerprint, row["id"]),
+        )
+        if updated.rowcount:
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'legacy_block_loop_migrated', ?, ?)",
+                (
+                    row["id"],
+                    json.dumps({"fingerprint": fingerprint}, ensure_ascii=False),
+                    now,
+                ),
+            )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -3264,6 +3577,366 @@ def _append_event(
     )
 
 
+def get_adjudication(
+    conn: sqlite3.Connection, decision_id: str
+) -> Optional[Adjudication]:
+    row = conn.execute(
+        "SELECT * FROM task_adjudications WHERE decision_id = ?",
+        (decision_id,),
+    ).fetchone()
+    return Adjudication.from_row(row) if row is not None else None
+
+
+def list_adjudications(
+    conn: sqlite3.Connection, task_id: str
+) -> list[Adjudication]:
+    rows = conn.execute(
+        "SELECT * FROM task_adjudications WHERE task_id = ? "
+        "ORDER BY created_at ASC, decision_id ASC",
+        (task_id,),
+    ).fetchall()
+    return [Adjudication.from_row(row) for row in rows]
+
+
+def latest_adjudication(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[Adjudication]:
+    row = conn.execute(
+        "SELECT * FROM task_adjudications WHERE task_id = ? "
+        "ORDER BY created_at DESC, decision_id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return Adjudication.from_row(row) if row is not None else None
+
+
+def create_adjudication(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision_id: str,
+    fingerprint: Optional[str] = None,
+    trigger_run_id: Optional[int] = None,
+    trigger_event_id: Optional[int] = None,
+    evidence: Optional[list[str]] = None,
+    action: Optional[str] = None,
+    resume_profile: Optional[str] = None,
+    child_task_id: Optional[str] = None,
+) -> Adjudication:
+    """Queue one idempotent adjudication for an escalated task."""
+    decision_id = decision_id.strip()
+    if not decision_id:
+        raise ValueError("decision_id is required")
+    existing = get_adjudication(conn, decision_id)
+    if existing is not None:
+        if existing.task_id != task_id:
+            raise ValueError("decision_id already belongs to another task")
+        return existing
+
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None:
+            raise ValueError(f"task {task_id} not found")
+        if task.status != "escalated":
+            raise ValueError(
+                f"task {task_id} is {task.status!r}; adjudication requires 'escalated'"
+            )
+        resolved_fingerprint = (
+            fingerprint or task.block_fingerprint or
+            compute_block_fingerprint(task.block_kind, None)
+        ).strip()
+        now = int(time.time())
+        evidence_json = json.dumps(evidence or [], ensure_ascii=False)
+        try:
+            conn.execute(
+                """
+                INSERT INTO task_adjudications (
+                    decision_id, task_id, trigger_run_id, trigger_event_id,
+                    fingerprint, block_kind, status, evidence, action,
+                    resume_profile, child_task_id, attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    decision_id, task_id, trigger_run_id, trigger_event_id,
+                    resolved_fingerprint, task.block_kind, evidence_json, action,
+                    resume_profile, child_task_id, now, now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # A racing scheduler may have inserted the same trigger with its
+            # deterministic id. Return that durable winner rather than
+            # creating a duplicate diagnostic task.
+            row = conn.execute(
+                "SELECT * FROM task_adjudications WHERE task_id = ? "
+                "AND fingerprint = ? AND trigger_event_id IS ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (task_id, resolved_fingerprint, trigger_event_id),
+            ).fetchone()
+            if row is None:
+                raise
+            return Adjudication.from_row(row)
+        _append_event(
+            conn,
+            task_id,
+            "adjudication_queued",
+            {
+                "decision_id": decision_id,
+                "fingerprint": resolved_fingerprint,
+                "child_task_id": child_task_id,
+            },
+            run_id=trigger_run_id,
+        )
+    created = get_adjudication(conn, decision_id)
+    if created is None:  # pragma: no cover - transaction invariant
+        raise RuntimeError("adjudication insert did not persist")
+    return created
+
+
+def start_adjudication(
+    conn: sqlite3.Connection,
+    decision_id: str,
+    *,
+    worker_session_id: str,
+    child_task_id: Optional[str] = None,
+) -> Adjudication:
+    session = worker_session_id.strip()
+    if not session:
+        raise ValueError("worker_session_id is required when adjudication starts")
+    with write_txn(conn):
+        current = get_adjudication(conn, decision_id)
+        if current is None:
+            raise ValueError(f"adjudication {decision_id} not found")
+        if current.applied_at is not None:
+            return current
+        if (
+            current.status == "running"
+            and current.worker_session_id == session
+            and (child_task_id is None or current.child_task_id == child_task_id)
+        ):
+            return current
+        if current.status not in {"queued", "running"}:
+            raise ValueError(
+                f"adjudication {decision_id} cannot start from {current.status!r}"
+            )
+        if (
+            current.status == "running"
+            and current.worker_session_id
+            and current.worker_session_id != session
+        ):
+            raise ValueError("adjudication is already owned by another worker session")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_adjudications SET status = 'running', "
+            "worker_session_id = ?, child_task_id = COALESCE(?, child_task_id), "
+            "attempts = attempts + CASE WHEN status = 'queued' THEN 1 ELSE 0 END, "
+            "updated_at = ? WHERE decision_id = ? AND status IN ('queued', 'running')",
+            (session, child_task_id, now, decision_id),
+        )
+        _append_event(
+            conn,
+            current.task_id,
+            "adjudication_started",
+            {
+                "decision_id": decision_id,
+                "worker_session_id": session,
+                "child_task_id": child_task_id or current.child_task_id,
+            },
+        )
+    result = get_adjudication(conn, decision_id)
+    if result is None:  # pragma: no cover
+        raise RuntimeError("adjudication disappeared")
+    return result
+
+
+def decide_adjudication(
+    conn: sqlite3.Connection,
+    decision_id: str,
+    *,
+    verdict: str,
+    evidence: Optional[list[str]] = None,
+    action: Optional[str] = None,
+    resume_profile: Optional[str] = None,
+    outcome: Optional[str] = None,
+) -> Adjudication:
+    if verdict not in VALID_ADJUDICATION_VERDICTS:
+        raise ValueError(
+            f"verdict must be one of {sorted(VALID_ADJUDICATION_VERDICTS)}"
+        )
+    with write_txn(conn):
+        current = get_adjudication(conn, decision_id)
+        if current is None:
+            raise ValueError(f"adjudication {decision_id} not found")
+        if current.applied_at is not None:
+            return current
+        if current.status in {"decided", "needs_human"}:
+            if current.verdict == verdict:
+                return current
+            raise ValueError(
+                f"adjudication {decision_id} already decided as {current.verdict!r}"
+            )
+        # A verdict is an output of the adjudicator run, not a free-standing
+        # status write. Require an observable worker session before accepting
+        # it; this prevents a scheduler poll (or a stale UI request) from
+        # deciding an escalation that never actually ran. Human decisions
+        # still use the same path: the controller starts the bounded
+        # adjudication session first, then records the human-required verdict.
+        if current.status != "running" or not current.worker_session_id:
+            raise ValueError(
+                "adjudication must be running with a worker_session_id before it can be decided"
+            )
+        if current.status not in {"queued", "running"}:
+            raise ValueError(
+                f"adjudication {decision_id} cannot be decided from {current.status!r}"
+            )
+        status = "needs_human" if verdict == "needs_human" else "decided"
+        now = int(time.time())
+        evidence_json = json.dumps(
+            evidence if evidence is not None else current.evidence,
+            ensure_ascii=False,
+        )
+        conn.execute(
+            """
+            UPDATE task_adjudications
+               SET status = ?, verdict = ?, evidence = ?,
+                   action = COALESCE(?, action),
+                   resume_profile = COALESCE(?, resume_profile),
+                   outcome = COALESCE(?, outcome), updated_at = ?
+             WHERE decision_id = ? AND applied_at IS NULL
+            """,
+            (
+                status, verdict, evidence_json, action, resume_profile,
+                outcome, now, decision_id,
+            ),
+        )
+        _append_event(
+            conn,
+            current.task_id,
+            "adjudication_decided",
+            {
+                "decision_id": decision_id,
+                "verdict": verdict,
+                "action": action or current.action,
+            },
+        )
+    result = get_adjudication(conn, decision_id)
+    if result is None:  # pragma: no cover
+        raise RuntimeError("adjudication disappeared")
+    return result
+
+
+def fail_adjudication(
+    conn: sqlite3.Connection, decision_id: str, *, outcome: str
+) -> Adjudication:
+    with write_txn(conn):
+        current = get_adjudication(conn, decision_id)
+        if current is None:
+            raise ValueError(f"adjudication {decision_id} not found")
+        if current.applied_at is not None:
+            return current
+        if current.status == "failed":
+            return current
+        if current.status not in {"queued", "running"}:
+            raise ValueError(
+                f"adjudication {decision_id} cannot fail from {current.status!r}"
+            )
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_adjudications SET status = 'failed', outcome = ?, "
+            "updated_at = ? WHERE decision_id = ? AND applied_at IS NULL",
+            (outcome, now, decision_id),
+        )
+        _append_event(
+            conn,
+            current.task_id,
+            "adjudication_failed",
+            {"decision_id": decision_id, "outcome": outcome},
+        )
+    result = get_adjudication(conn, decision_id)
+    if result is None:  # pragma: no cover
+        raise RuntimeError("adjudication disappeared")
+    return result
+
+
+def apply_adjudication(
+    conn: sqlite3.Connection, decision_id: str
+) -> Adjudication:
+    """Atomically apply a decided escalation without generic unblock bypasses."""
+    with write_txn(conn):
+        current = get_adjudication(conn, decision_id)
+        if current is None:
+            raise ValueError(f"adjudication {decision_id} not found")
+        if current.applied_at is not None:
+            return current
+        if current.verdict not in VALID_ADJUDICATION_VERDICTS:
+            raise ValueError("adjudication must have a valid verdict before apply")
+        if current.status not in {"decided", "needs_human"}:
+            raise ValueError(
+                f"adjudication {decision_id} must be decided before apply (status={current.status!r})"
+            )
+        task = get_task(conn, current.task_id)
+        if task is None:
+            raise ValueError(f"task {current.task_id} not found")
+        if task.status != "escalated":
+            raise ValueError(
+                f"task {task.id} is {task.status!r}; adjudication apply requires 'escalated'"
+            )
+
+        verdict = current.verdict
+        if verdict in {"resume", "accept_baseline"}:
+            undone_parent = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task.id,),
+            ).fetchone()
+            target_status = "todo" if undone_parent else "ready"
+        elif verdict == "wait_dependency":
+            target_status = "todo"
+        elif verdict == "cancel":
+            target_status = "archived"
+        else:
+            target_status = "escalated"
+
+        now = int(time.time())
+        updated = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?,
+                   assignee = COALESCE(?, assignee),
+                   current_run_id = NULL,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                   consecutive_failures = CASE WHEN ? IN ('ready', 'todo') THEN 0 ELSE consecutive_failures END,
+                   last_failure_error = CASE WHEN ? IN ('ready', 'todo') THEN NULL ELSE last_failure_error END
+             WHERE id = ? AND status = 'escalated'
+            """,
+            (
+                target_status, current.resume_profile,
+                target_status, target_status, task.id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("task status changed during adjudication apply")
+        final_status = "needs_human" if verdict == "needs_human" else "applied"
+        conn.execute(
+            "UPDATE task_adjudications SET status = ?, applied_at = ?, "
+            "updated_at = ? WHERE decision_id = ? AND applied_at IS NULL",
+            (final_status, now, now, decision_id),
+        )
+        _append_event(
+            conn,
+            task.id,
+            "adjudication_applied",
+            {
+                "decision_id": decision_id,
+                "verdict": verdict,
+                "status": target_status,
+                "resume_profile": current.resume_profile,
+            },
+        )
+    result = get_adjudication(conn, decision_id)
+    if result is None:  # pragma: no cover
+        raise RuntimeError("adjudication disappeared")
+    return result
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4204,6 +4877,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
+                       block_fingerprint = NULL,
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
@@ -4221,6 +4895,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
+                       block_fingerprint = NULL,
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
@@ -4910,6 +5585,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    fingerprint: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -4928,31 +5604,39 @@ def block_task(
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
       is re-blocked for the SAME kind after having been unblocked, the
       unblock-loop counter (``block_recurrences``) increments. When it reaches
-      :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
+      :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``escalated`` instead
       of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
-      forcing a human-in-the-loop triage decision.
+      requiring a bounded adjudication decision.
 
     * ``transient`` — treated like a generic block for routing, but a worker
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
-    ``triage``), False when the task wasn't in a blockable state.
+    ``escalated``), False when the task wasn't in a blockable state.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    fingerprint = (fingerprint or compute_block_fingerprint(kind, reason)).strip()
+    if not fingerprint:
+        raise ValueError("block fingerprint must not be empty")
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_fingerprint, block_recurrences "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
-        prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
+        prev_fingerprint = (
+            cur_row["block_fingerprint"]
+            if "block_fingerprint" in cur_row.keys()
+            else None
+        )
         prev_recurrences = (
             int(cur_row["block_recurrences"])
             if "block_recurrences" in cur_row.keys()
@@ -4972,12 +5656,14 @@ def block_task(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
-                       block_kind    = ?
+                       block_kind    = ?,
+                       block_fingerprint = ?,
+                       block_recurrences = 1
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (kind, fingerprint, task_id) if expected_run_id is None
+                else (kind, fingerprint, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -4992,7 +5678,7 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {"reason": reason, "kind": kind, "fingerprint": fingerprint}, run_id=run_id,
             )
             routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
@@ -5007,31 +5693,35 @@ def block_task(
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
+        # re-block for the SAME concrete fingerprint after a prior unblock.
+        # block_task only
         # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
+        # the work pool), so a stored matching fingerprint means:
+        # blocked → unblocked → about-to-re-block for the same cause.
+        # Legacy rows without a fingerprint start a new budget rather than
+        # guessing that every failure in the same broad category is identical.
+        same_cause = bool(prev_fingerprint and prev_fingerprint == fingerprint)
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
+            # to Escalated for evidence-driven adjudication instead of mixing
+            # it with rough ideas in Triage.
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'triage',
+                   SET status        = 'escalated',
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
                        block_kind    = ?,
+                       block_fingerprint = ?,
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (kind, fingerprint, recurrences, task_id) if expected_run_id is None
+                else (kind, fingerprint, recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -5049,12 +5739,13 @@ def block_task(
                 {
                     "reason": reason,
                     "kind": kind,
+                    "fingerprint": fingerprint,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                 },
                 run_id=run_id,
             )
-            routed_to = "triage"
+            routed_to = "escalated"
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -5065,11 +5756,12 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
+                           block_fingerprint = ?,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (kind, recurrences, task_id),
+                    (kind, fingerprint, recurrences, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -5080,12 +5772,13 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
+                           block_fingerprint = ?,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (kind, fingerprint, recurrences, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
                 return False
@@ -5104,7 +5797,12 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "fingerprint": fingerprint,
+                    "recurrences": recurrences,
+                },
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
@@ -5231,12 +5929,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
-        # NOTE: deliberately does NOT touch ``block_recurrences`` or
-        # ``block_kind``. Resetting the recurrence counter on unblock is exactly
+        # NOTE: deliberately does NOT touch ``block_recurrences``,
+        # ``block_kind``, or ``block_fingerprint``. Resetting them on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
         # unbounded (Dale's report). The counter survives the unblock so that a
         # subsequent same-cause ``block_task`` can detect the loop and route to
-        # triage at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
+        # escalation at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
         # successful completion (see ``complete_task``). ``consecutive_failures``
         # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
         # still reset here, which is correct: a deliberate unblock is a fresh

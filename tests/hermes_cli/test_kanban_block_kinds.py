@@ -8,8 +8,8 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 * ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
   never enter the human ``blocked`` bucket a cron would keep unblocking.
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
-  each same-cause re-block after an unblock increments ``block_recurrences``,
-  and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+  each matching-fingerprint re-block increments ``block_recurrences``, and at
+  ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``escalated`` for adjudication.
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
   amnesia that let the loop run unbounded).
 * A successful ``complete_task`` resets the loop memory.
@@ -78,16 +78,16 @@ def test_unblock_does_not_reset_recurrence_counter(kanban_home: Path) -> None:
         assert t.block_kind == "needs_input"  # kind preserved for comparison
 
 
-def test_same_cause_reblock_routes_to_triage(kanban_home: Path) -> None:
-    """Dale's loop: block → unblock → re-block same kind → triage."""
+def test_same_cause_reblock_routes_to_escalated(kanban_home: Path) -> None:
+    """A matching concrete fingerprint routes to adjudication."""
     with kb.connect_closing() as conn:
         tid = _running_task(conn)
         kb.block_task(conn, tid, reason="need creds", kind="needs_input")
         kb.unblock_task(conn, tid)
         _make_running_again(conn, tid)
-        kb.block_task(conn, tid, reason="still need creds", kind="needs_input")
+        kb.block_task(conn, tid, reason="need creds", kind="needs_input")
         t = kb.get_task(conn, tid)
-        assert t.status == "triage"
+        assert t.status == "escalated"
         assert t.block_recurrences == 2
 
 
@@ -98,8 +98,8 @@ def test_untyped_block_loop_also_protected(kanban_home: Path) -> None:
         kb.block_task(conn, tid, reason="a")
         kb.unblock_task(conn, tid)
         _make_running_again(conn, tid)
-        kb.block_task(conn, tid, reason="a again")
-        assert kb.get_task(conn, tid).status == "triage"
+        kb.block_task(conn, tid, reason="a")
+        assert kb.get_task(conn, tid).status == "escalated"
 
 
 def test_different_kinds_do_not_compound(kanban_home: Path) -> None:
@@ -113,6 +113,36 @@ def test_different_kinds_do_not_compound(kanban_home: Path) -> None:
         t = kb.get_task(conn, tid)
         assert t.status == "blocked"
         assert t.block_recurrences == 1
+
+
+def test_same_kind_different_fingerprints_have_independent_budgets(
+    kanban_home: Path,
+) -> None:
+    """A 404 assertion and a Reaper failure must never share recurrence state."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(
+            conn,
+            tid,
+            reason="company.e2e-spec.ts expected 200 but received 404",
+            kind="transient",
+        )
+        first = kb.get_task(conn, tid)
+        assert first is not None
+        first_fingerprint = first.block_fingerprint
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(
+            conn,
+            tid,
+            reason="Testcontainers Reaper failed to start",
+            kind="transient",
+        )
+        second = kb.get_task(conn, tid)
+        assert second is not None
+        assert second.status == "blocked"
+        assert second.block_recurrences == 1
+        assert second.block_fingerprint != first_fingerprint
 
 
 def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:

@@ -1000,9 +1000,174 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _adjudication_event_state(events: list[Any]) -> dict[str, Any]:
+    """Return the latest durable adjudication state represented by task events."""
+    state: dict[str, Any] = {
+        "decision_id": None,
+        "status": None,
+        "timestamp": 0,
+        "payload": {},
+    }
+    event_to_status = {
+        "adjudication_queued": "queued",
+        "adjudication_started": "running",
+        "adjudication_decided": "decided",
+        "adjudication_failed": "failed",
+        "adjudication_applied": "applied",
+    }
+    for event in events:
+        kind = _event_kind(event)
+        if kind not in event_to_status:
+            continue
+        payload = _parse_payload(event)
+        state = {
+            "decision_id": payload.get("decision_id"),
+            "status": event_to_status[kind],
+            "timestamp": _event_ts(event),
+            "payload": payload,
+        }
+    return state
+
+
+def _rule_block_loop_escalated(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """An escalation is an immediate operator-visible condition, not triage."""
+    if _task_field(task, "status") != "escalated":
+        return []
+    loop_events = [
+        event for event in events
+        if _event_kind(event) in {"block_loop_detected", "legacy_block_loop_migrated"}
+    ]
+    if not loop_events:
+        return []
+    state = _adjudication_event_state(events)
+    decision_status = state.get("status")
+    actions = [DiagnosticAction(
+        kind="cli_hint",
+        label="Inspect or queue adjudication",
+        payload={
+            "command": f"hermes kanban adjudications {_task_field(task, 'id')}"
+        },
+        suggested=True,
+    )]
+    return [Diagnostic(
+        kind="block_loop_escalated",
+        severity="error",
+        title="Repeated block requires adjudication",
+        detail=(
+            "The same normalized block fingerprint exhausted its automatic "
+            "recovery budget. The task remains isolated until a durable "
+            "adjudication is decided and applied."
+        ),
+        actions=actions,
+        first_seen_at=_event_ts(loop_events[0]),
+        last_seen_at=_event_ts(loop_events[-1]),
+        count=len(loop_events),
+        data={
+            "fingerprint": _task_field(task, "block_fingerprint"),
+            "block_kind": _task_field(task, "block_kind"),
+            "recurrences": _task_field(task, "block_recurrences", 0),
+            "decision_id": state.get("decision_id"),
+            "decision_status": decision_status,
+            "adjudication_missing": decision_status is None,
+        },
+    )]
+
+
+def _rule_adjudication_stalled(task, events, runs, now, cfg) -> list[Diagnostic]:
+    if _task_field(task, "status") != "escalated":
+        return []
+    state = _adjudication_event_state(events)
+    if state.get("status") not in {"queued", "running"}:
+        return []
+    threshold = _positive_int(cfg.get("adjudication_stale_seconds"), 15 * 60)
+    age = now - int(state.get("timestamp") or now)
+    if age < threshold:
+        return []
+    return [Diagnostic(
+        kind="adjudication_stalled",
+        severity="error",
+        title="Adjudication is not making progress",
+        detail=(
+            f"Decision {state.get('decision_id') or '<unknown>'} has remained "
+            f"{state.get('status')} for {int(age / 60)} minutes. Reconcile the "
+            "worker run before creating any replacement task."
+        ),
+        actions=[DiagnosticAction(
+            kind="cli_hint",
+            label="Inspect adjudication state",
+            payload={
+                "command": f"hermes kanban adjudications {_task_field(task, 'id')}"
+            },
+            suggested=True,
+        )],
+        first_seen_at=int(state.get("timestamp") or now),
+        last_seen_at=int(state.get("timestamp") or now),
+        data={"decision_id": state.get("decision_id"), "age_seconds": age},
+    )]
+
+
+def _rule_adjudication_session_missing(task, events, runs, now, cfg) -> list[Diagnostic]:
+    if _task_field(task, "status") != "escalated":
+        return []
+    state = _adjudication_event_state(events)
+    if state.get("status") != "running":
+        return []
+    if str(state.get("payload", {}).get("worker_session_id") or "").strip():
+        return []
+    return [Diagnostic(
+        kind="adjudication_session_missing",
+        severity="critical",
+        title="Adjudicator has no observable worker session",
+        detail=(
+            "The adjudication is marked running but no worker_session_id was "
+            "recorded. Do not infer progress from a PID; reconcile or fail the run."
+        ),
+        actions=[DiagnosticAction(
+            kind="reclaim",
+            label="Reconcile adjudicator run",
+            payload={"decision_id": state.get("decision_id")},
+            suggested=True,
+        )],
+        first_seen_at=int(state.get("timestamp") or now),
+        last_seen_at=int(state.get("timestamp") or now),
+        data={"decision_id": state.get("decision_id")},
+    )]
+
+
+def _rule_adjudication_failed(task, events, runs, now, cfg) -> list[Diagnostic]:
+    if _task_field(task, "status") != "escalated":
+        return []
+    state = _adjudication_event_state(events)
+    if state.get("status") != "failed":
+        return []
+    outcome = state.get("payload", {}).get("outcome")
+    return [Diagnostic(
+        kind="adjudication_failed",
+        severity="critical",
+        title="Adjudication failed and needs human recovery",
+        detail=(
+            f"Decision {state.get('decision_id') or '<unknown>'} failed"
+            f"{': ' + str(outcome) if outcome else ''}. Evidence remains durable; "
+            "do not move the parent out of escalation manually."
+        ),
+        actions=[DiagnosticAction(
+            kind="comment",
+            label="Record a concrete human decision",
+            suggested=True,
+        )],
+        first_seen_at=int(state.get("timestamp") or now),
+        last_seen_at=int(state.get("timestamp") or now),
+        data={"decision_id": state.get("decision_id"), "outcome": outcome},
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
+    _rule_adjudication_failed,
+    _rule_adjudication_session_missing,
+    _rule_adjudication_stalled,
+    _rule_block_loop_escalated,
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
@@ -1017,6 +1182,10 @@ _RULES: list[RuleFn] = [
 # Known kinds (for the UI's filter / legend / i18n keys). Update when
 # rules are added.
 DIAGNOSTIC_KINDS = (
+    "adjudication_failed",
+    "adjudication_session_missing",
+    "adjudication_stalled",
+    "block_loop_escalated",
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",
@@ -1040,6 +1209,7 @@ DEFAULT_CONFIG = {
     # signal is dominated by tasks that are about to be claimed on the
     # next dispatcher tick (default 60s) and would just be noise.
     "stranded_threshold_seconds": 30 * 60,
+    "adjudication_stale_seconds": 15 * 60,
 }
 
 

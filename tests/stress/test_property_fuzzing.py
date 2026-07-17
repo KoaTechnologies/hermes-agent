@@ -7,8 +7,7 @@ task graphs. After each step, checks the full invariant set:
       ended_at MUST be NULL (we never point at a closed run).
   I2. If a run has ended_at NULL, SOME task MUST have current_run_id
       pointing at it (no orphan open runs).
-  I3. task.status in the valid set {triage, todo, ready, running,
-      blocked, done, archived}.
+  I3. task.status in the canonical ``kanban_db.VALID_STATUSES`` set.
   I4. task.claim_lock NULL iff status not in (running,).
   I5. Every run has started_at <= ended_at (or ended_at is NULL).
   I6. If outcome is set, ended_at must also be set.
@@ -74,7 +73,10 @@ def assert_invariants(conn, kb, ops_log):
         failures.append(f"I2: open run {row['id']} on task {row['task_id']} has no pointer")
 
     # I3: valid statuses
-    valid = {"triage", "todo", "ready", "running", "blocked", "done", "archived"}
+    # Keep the invariant coupled to the runtime state machine so adding a
+    # first-class lane (e.g. ``escalated``) cannot make the fuzz harness report
+    # a false violation.
+    valid = set(kb.VALID_STATUSES)
     bad_status = conn.execute("SELECT id, status FROM tasks").fetchall()
     for row in bad_status:
         if row["status"] not in valid:

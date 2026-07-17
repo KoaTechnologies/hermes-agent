@@ -21,6 +21,7 @@ import os
 import shlex
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -39,6 +40,7 @@ _STATUS_ICONS = {
     "running":  "●",
     "scheduled":"⏱",
     "blocked":  "⊘",
+    "escalated":"!",
     "done":     "✓",
     "archived": "—",
 }
@@ -78,6 +80,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
         "session_id": t.session_id,
+        "block_kind": t.block_kind,
+        "block_fingerprint": t.block_fingerprint,
+        "block_recurrences": t.block_recurrences,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
@@ -584,7 +589,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "when parents finish, no human); 'needs_input'/'capability' go to "
             "blocked for a human; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
-            "triage to break unblock loops. Omit for a generic block."
+            "escalated to break unblock loops. Omit for a generic block."
         ),
     )
 
@@ -601,6 +606,34 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
+
+    p_adjudicate = sub.add_parser(
+        "adjudicate",
+        help="Create, advance, decide, and optionally apply an escalation decision",
+    )
+    p_adjudicate.add_argument("task_id")
+    p_adjudicate.add_argument("--decision-id", required=True)
+    p_adjudicate.add_argument("--fingerprint", default=None)
+    p_adjudicate.add_argument("--trigger-run-id", type=int, default=None)
+    p_adjudicate.add_argument("--trigger-event-id", type=int, default=None)
+    p_adjudicate.add_argument("--evidence", action="append", default=None)
+    p_adjudicate.add_argument("--action", default=None)
+    p_adjudicate.add_argument("--resume-profile", default=None)
+    p_adjudicate.add_argument("--child-task-id", default=None)
+    p_adjudicate.add_argument("--worker-session-id", default=None)
+    p_adjudicate.add_argument(
+        "--verdict", choices=sorted(kb.VALID_ADJUDICATION_VERDICTS), default=None
+    )
+    p_adjudicate.add_argument("--outcome", default=None)
+    p_adjudicate.add_argument("--fail", action="store_true")
+    p_adjudicate.add_argument("--apply", action="store_true")
+    p_adjudicate.add_argument("--json", action="store_true")
+
+    p_adjudications = sub.add_parser(
+        "adjudications", help="List durable adjudication decisions for a task"
+    )
+    p_adjudications.add_argument("task_id")
+    p_adjudications.add_argument("--json", action="store_true")
 
     p_promote = sub.add_parser(
         "promote",
@@ -977,6 +1010,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "adjudicate": _cmd_adjudicate,
+            "adjudications": _cmd_adjudications,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1483,6 +1518,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        adjudications = kb.list_adjudications(conn, args.task_id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1500,6 +1536,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             ],
             "events": [
                 {
+                    "id": e.id,
                     "kind": e.kind,
                     "payload": e.payload,
                     "created_at": e.created_at,
@@ -1518,11 +1555,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     "error": r.error,
                     "metadata": r.metadata,
                     "worker_pid": r.worker_pid,
+                    "worker_session_id": r.worker_session_id,
+                    "last_heartbeat_at": r.last_heartbeat_at,
                     "started_at": r.started_at,
                     "ended_at": r.ended_at,
                 }
                 for r in runs
             ],
+            "adjudications": [asdict(item) for item in adjudications],
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
@@ -2056,16 +2096,16 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
                 # Report where the task actually landed — dependency blocks go
-                # to todo, and a tripped unblock-loop breaker routes to triage.
+                # to todo, and a tripped unblock-loop breaker routes to Escalated.
                 landed = kb.get_task(conn, tid)
                 where = landed.status if landed else "blocked"
                 suffix = f": {reason}" if reason else ""
                 if where == "todo":
                     print(f"{tid} → todo (dependency wait){suffix}")
-                elif where == "triage":
+                elif where == "escalated":
                     print(
-                        f"{tid} → triage (unblock loop detected — needs a "
-                        f"human decision){suffix}"
+                        f"{tid} → escalated (matching block loop detected — "
+                        f"adjudication required){suffix}"
                     )
                 else:
                     print(f"Blocked {tid}{suffix}")
@@ -2114,6 +2154,79 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_adjudicate(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        decision = kb.get_adjudication(conn, args.decision_id)
+        if decision is None:
+            decision = kb.create_adjudication(
+                conn,
+                args.task_id,
+                decision_id=args.decision_id,
+                fingerprint=args.fingerprint,
+                trigger_run_id=args.trigger_run_id,
+                trigger_event_id=args.trigger_event_id,
+                evidence=args.evidence,
+                action=args.action,
+                resume_profile=args.resume_profile,
+                child_task_id=args.child_task_id,
+            )
+        elif decision.task_id != args.task_id:
+            raise ValueError("decision_id belongs to another task")
+
+        if args.worker_session_id:
+            decision = kb.start_adjudication(
+                conn,
+                args.decision_id,
+                worker_session_id=args.worker_session_id,
+                child_task_id=args.child_task_id,
+            )
+        if args.fail:
+            if not args.outcome:
+                raise ValueError("--fail requires --outcome")
+            decision = kb.fail_adjudication(
+                conn, args.decision_id, outcome=args.outcome
+            )
+        elif args.verdict:
+            decision = kb.decide_adjudication(
+                conn,
+                args.decision_id,
+                verdict=args.verdict,
+                evidence=args.evidence,
+                action=args.action,
+                resume_profile=args.resume_profile,
+                outcome=args.outcome,
+            )
+        if args.apply:
+            decision = kb.apply_adjudication(conn, args.decision_id)
+
+    payload = asdict(decision)
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"{decision.decision_id}: {decision.status} "
+            f"({decision.verdict or 'pending'}) for {decision.task_id}"
+        )
+    return 0
+
+
+def _cmd_adjudications(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        decisions = kb.list_adjudications(conn, args.task_id)
+    payload = [asdict(item) for item in decisions]
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    elif not decisions:
+        print(f"No adjudications for {args.task_id}")
+    else:
+        for item in decisions:
+            print(
+                f"{item.decision_id}  {item.status:12s}  "
+                f"{item.verdict or '-':18s}  {item.fingerprint}"
+            )
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
@@ -2517,7 +2630,10 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in (
+        "triage", "todo", "scheduled", "ready", "running", "blocked",
+        "escalated", "review", "done",
+    ):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")

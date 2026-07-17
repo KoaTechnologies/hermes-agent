@@ -148,7 +148,7 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "escalated", "review", "done",
 ]
 
 
@@ -160,6 +160,7 @@ def _task_dict(
     *,
     latest_summary: Optional[str] = None,
     current_run: Optional[kanban_db.Run] = None,
+    latest_block_event: Optional[kanban_db.Event] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
     # Add derived age metrics so the UI can colour stale cards without
@@ -174,6 +175,36 @@ def _task_dict(
     # ``tasks.result``. ``None`` when no run has produced a summary yet.
     d["latest_summary"] = latest_summary
     d["current_run"] = _run_dict(current_run) if current_run is not None else None
+    block_payload = (
+        latest_block_event.payload
+        if latest_block_event is not None and isinstance(latest_block_event.payload, dict)
+        else {}
+    )
+    if task.block_fingerprint or latest_block_event is not None:
+        reason = block_payload.get("reason")
+        evidence = block_payload.get("evidence")
+        d["block"] = {
+            "kind": task.block_kind,
+            "fingerprint": task.block_fingerprint,
+            "recurrences": task.block_recurrences,
+            "reason": reason if isinstance(reason, str) else None,
+            "evidence": (
+                [str(item) for item in evidence]
+                if isinstance(evidence, list)
+                else []
+            ),
+            "next_action": (
+                "await adjudication"
+                if task.status == "escalated"
+                else "resolve blocker or apply recovery"
+            ),
+            "event_id": latest_block_event.id if latest_block_event is not None else None,
+            "updated_at": (
+                latest_block_event.created_at if latest_block_event is not None else None
+            ),
+        }
+    else:
+        d["block"] = None
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
 
@@ -235,6 +266,11 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "metadata": r.metadata,
         "error": r.error,
     }
+
+
+def _adjudication_dict(a: kanban_db.Adjudication) -> dict[str, Any]:
+    """Serialize an escalation decision without exposing implementation state."""
+    return asdict(a)
 
 
 # Hallucination-warning event kinds — see complete_task() in kanban_db.py.
@@ -473,6 +509,37 @@ def get_board(
             ).fetchall():
                 current_runs[int(row["id"])] = kanban_db.Run.from_row(row)
 
+        latest_block_events: dict[str, kanban_db.Event] = {}
+        task_ids = [t.id for t in tasks]
+        if task_ids:
+            placeholders = ",".join("?" for _ in task_ids)
+            block_rows = conn.execute(
+                "SELECT e.* FROM task_events e "
+                "JOIN (SELECT task_id, MAX(id) AS max_id FROM task_events "
+                f"WHERE task_id IN ({placeholders}) AND kind IN "
+                "('blocked', 'dependency_wait', 'block_loop_detected') "
+                "GROUP BY task_id) latest ON latest.max_id = e.id",
+                task_ids,
+            ).fetchall()
+            for row in block_rows:
+                try:
+                    payload = json.loads(row["payload"]) if row["payload"] else None
+                except (TypeError, json.JSONDecodeError):
+                    payload = None
+                event = kanban_db.Event(
+                    id=int(row["id"]),
+                    task_id=row["task_id"],
+                    kind=row["kind"],
+                    payload=payload,
+                    created_at=int(row["created_at"]),
+                    run_id=(
+                        int(row["run_id"])
+                        if row["run_id"] is not None
+                        else None
+                    ),
+                )
+                latest_block_events[event.task_id] = event
+
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
@@ -487,10 +554,17 @@ def get_board(
                 t,
                 latest_summary=preview,
                 current_run=current_run,
+                latest_block_event=latest_block_events.get(t.id),
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            latest_decision = kanban_db.latest_adjudication(conn, t.id)
+            d["adjudication"] = (
+                _adjudication_dict(latest_decision)
+                if latest_decision is not None
+                else None
+            )
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render
@@ -577,6 +651,15 @@ def get_task(
             task,
             latest_summary=full_summary,
             current_run=current_run,
+            latest_block_event=next(
+                (
+                    event
+                    for event in reversed(kanban_db.list_events(conn, task_id))
+                    if event.kind
+                    in ("blocked", "dependency_wait", "block_loop_detected")
+                ),
+                None,
+            ),
         )
         links = _links_for(conn, task_id)
         child_ids = links["children"]
@@ -616,7 +699,146 @@ def get_task(
                     state_name=run_state_name,
                 )
             ],
+            "adjudications": [
+                _adjudication_dict(a)
+                for a in kanban_db.list_adjudications(conn, task_id)
+            ],
         }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Adjudication API
+# ---------------------------------------------------------------------------
+
+class CreateAdjudicationBody(BaseModel):
+    decision_id: str
+    fingerprint: Optional[str] = None
+    trigger_run_id: Optional[int] = None
+    trigger_event_id: Optional[int] = None
+    evidence: list[str] = Field(default_factory=list)
+    action: Optional[str] = None
+    resume_profile: Optional[str] = None
+    child_task_id: Optional[str] = None
+
+
+class StartAdjudicationBody(BaseModel):
+    worker_session_id: str
+    child_task_id: Optional[str] = None
+
+
+class DecideAdjudicationBody(BaseModel):
+    verdict: str
+    evidence: Optional[list[str]] = None
+    action: Optional[str] = None
+    resume_profile: Optional[str] = None
+    outcome: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/adjudications")
+def create_task_adjudication(
+    task_id: str,
+    payload: CreateAdjudicationBody,
+    board: Optional[str] = Query(None),
+):
+    conn = _conn(board=_resolve_board(board))
+    try:
+        try:
+            decision = kanban_db.create_adjudication(
+                conn,
+                task_id,
+                decision_id=payload.decision_id,
+                fingerprint=payload.fingerprint,
+                trigger_run_id=payload.trigger_run_id,
+                trigger_event_id=payload.trigger_event_id,
+                evidence=payload.evidence,
+                action=payload.action,
+                resume_profile=payload.resume_profile,
+                child_task_id=payload.child_task_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"adjudication": _adjudication_dict(decision)}
+    finally:
+        conn.close()
+
+
+@router.get("/tasks/{task_id}/adjudications")
+def get_task_adjudications(task_id: str, board: Optional[str] = Query(None)):
+    conn = _conn(board=_resolve_board(board))
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        return {
+            "adjudications": [
+                _adjudication_dict(a)
+                for a in kanban_db.list_adjudications(conn, task_id)
+            ]
+        }
+    finally:
+        conn.close()
+
+
+@router.post("/adjudications/{decision_id}/start")
+def start_task_adjudication(
+    decision_id: str,
+    payload: StartAdjudicationBody,
+    board: Optional[str] = Query(None),
+):
+    conn = _conn(board=_resolve_board(board))
+    try:
+        try:
+            decision = kanban_db.start_adjudication(
+                conn,
+                decision_id,
+                worker_session_id=payload.worker_session_id,
+                child_task_id=payload.child_task_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"adjudication": _adjudication_dict(decision)}
+    finally:
+        conn.close()
+
+
+@router.post("/adjudications/{decision_id}/decide")
+def decide_task_adjudication(
+    decision_id: str,
+    payload: DecideAdjudicationBody,
+    board: Optional[str] = Query(None),
+):
+    conn = _conn(board=_resolve_board(board))
+    try:
+        try:
+            decision = kanban_db.decide_adjudication(
+                conn,
+                decision_id,
+                verdict=payload.verdict,
+                evidence=payload.evidence,
+                action=payload.action,
+                resume_profile=payload.resume_profile,
+                outcome=payload.outcome,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"adjudication": _adjudication_dict(decision)}
+    finally:
+        conn.close()
+
+
+@router.post("/adjudications/{decision_id}/apply")
+def apply_task_adjudication(
+    decision_id: str,
+    board: Optional[str] = Query(None),
+):
+    conn = _conn(board=_resolve_board(board))
+    try:
+        try:
+            decision = kanban_db.apply_adjudication(conn, decision_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"adjudication": _adjudication_dict(decision)}
     finally:
         conn.close()
 
@@ -858,6 +1080,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
+        if (
+            task.status == "escalated"
+            and payload.status is not None
+            and payload.status != "escalated"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Escalated tasks can only leave escalation through an "
+                    "atomic adjudication apply"
+                ),
+            )
+
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
             try:
@@ -899,6 +1134,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=400,
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
                 )
+            elif s == "escalated":
+                if task.status != "escalated":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Cannot set status to 'escalated' directly; the block-loop "
+                            "transition owns escalation"
+                        ),
+                    )
             elif s in ("todo", "triage", "scheduled"):
                 ok = _set_status_direct(conn, task_id, s)
             else:

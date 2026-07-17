@@ -62,6 +62,61 @@ def _run(outcome="completed", run_id=1, error=None):
     }
 
 
+def test_escalated_block_loop_is_immediately_visible():
+    task = _task(
+        status="escalated",
+        block_kind="transient",
+        block_fingerprint="fp-404",
+        block_recurrences=2,
+    )
+    events = [
+        _event(
+            "block_loop_detected",
+            ts=100,
+            fingerprint="fp-404",
+            recurrences=2,
+        )
+    ]
+    diagnostics = kd.compute_task_diagnostics(task, events, [], now=101)
+    escalation = next(d for d in diagnostics if d.kind == "block_loop_escalated")
+    assert escalation.severity == "error"
+    assert escalation.data["adjudication_missing"] is True
+
+
+def test_stalled_adjudication_and_failed_decision_are_diagnosed():
+    task = _task(status="escalated", block_fingerprint="fp")
+    queued = [
+        _event("block_loop_detected", ts=1, fingerprint="fp"),
+        _event("adjudication_queued", ts=10, decision_id="d1"),
+    ]
+    diagnostics = kd.compute_task_diagnostics(
+        task,
+        queued,
+        [],
+        now=100,
+        config={"adjudication_stale_seconds": 30},
+    )
+    assert "adjudication_stalled" in {d.kind for d in diagnostics}
+
+    failed = queued + [
+        _event("adjudication_failed", ts=20, decision_id="d1", outcome="timeout")
+    ]
+    diagnostics = kd.compute_task_diagnostics(task, failed, [], now=21)
+    failure = next(d for d in diagnostics if d.kind == "adjudication_failed")
+    assert failure.severity == "critical"
+    assert failure.data["outcome"] == "timeout"
+
+
+def test_running_adjudication_without_session_is_critical():
+    task = _task(status="escalated")
+    events = [
+        _event("block_loop_detected", ts=1),
+        _event("adjudication_started", ts=2, decision_id="d1"),
+    ]
+    diagnostics = kd.compute_task_diagnostics(task, events, [], now=3)
+    assert "adjudication_session_missing" in {d.kind for d in diagnostics}
+
+
 # ---------------------------------------------------------------------------
 # Each rule — positive + negative + clearing
 # ---------------------------------------------------------------------------

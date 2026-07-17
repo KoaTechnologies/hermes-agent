@@ -199,7 +199,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
 
     # Cycle 2: unblock → block again for a DIFFERENT reason. A distinct
     # block cause must still notify. (A *same*-cause re-block instead trips
-    # the unblock-loop breaker and routes to triage — covered by
+    # the unblock-loop breaker and routes to escalation — covered by
     # test_kanban_block_kinds.py; here we exercise two genuinely different
     # blocks, which is the case the user wants notified twice.)
     runner._running = True

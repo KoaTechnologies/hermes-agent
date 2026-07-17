@@ -80,6 +80,103 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_escalated_column_and_adjudication_endpoints(client):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Escalated BUI-53", assignee="builder")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='escalated', block_kind='transient', "
+                "block_fingerprint='fp-404', block_recurrences=2 WHERE id=?",
+                (task_id,),
+            )
+    finally:
+        conn.close()
+
+    created = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/adjudications",
+        json={
+            "decision_id": "decision-api-1",
+            "fingerprint": "fp-404",
+            "trigger_event_id": 17,
+            "evidence": ["run:2"],
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["adjudication"]["status"] == "queued"
+
+    # Idempotent scheduler polls return the existing decision.
+    duplicate = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/adjudications",
+        json={
+            "decision_id": "decision-api-1",
+            "fingerprint": "fp-404",
+            "trigger_event_id": 17,
+        },
+    )
+    assert duplicate.status_code == 200
+
+    board = client.get("/api/plugins/kanban/board").json()
+    escalated = next(c for c in board["columns"] if c["name"] == "escalated")
+    assert escalated["tasks"][0]["adjudication"]["decision_id"] == "decision-api-1"
+
+    direct_move = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}", json={"status": "ready"}
+    )
+    assert direct_move.status_code == 409
+    assert "atomic adjudication" in direct_move.json()["detail"]
+
+    started = client.post(
+        "/api/plugins/kanban/adjudications/decision-api-1/start",
+        json={"worker_session_id": "session-api-1", "child_task_id": "child-1"},
+    )
+    assert started.status_code == 200
+    assert started.json()["adjudication"]["worker_session_id"] == "session-api-1"
+    decided = client.post(
+        "/api/plugins/kanban/adjudications/decision-api-1/decide",
+        json={"verdict": "resume", "action": "return to builder"},
+    )
+    assert decided.status_code == 200
+    applied = client.post(
+        "/api/plugins/kanban/adjudications/decision-api-1/apply"
+    )
+    assert applied.status_code == 200
+    assert applied.json()["adjudication"]["status"] == "applied"
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()
+    assert detail["task"]["status"] == "ready"
+    assert len(detail["adjudications"]) == 1
+
+
+def test_board_exposes_live_block_evidence_instead_of_initial_body(client):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="BUI-53",
+            body="Initial Linear description",
+            assignee="builder",
+        )
+        reason = "Testcontainers Reaper failed to start for company.e2e-spec.ts"
+        assert kb.block_task(conn, task_id, reason=reason, kind="transient")
+        assert kb.unblock_task(conn, task_id)
+        assert kb.block_task(conn, task_id, reason=reason, kind="transient")
+    finally:
+        conn.close()
+
+    board = client.get("/api/plugins/kanban/board").json()
+    escalated = next(c for c in board["columns"] if c["name"] == "escalated")
+    card = next(task for task in escalated["tasks"] if task["id"] == task_id)
+    assert card["block"]["reason"] == reason
+    assert card["block"]["recurrences"] == 2
+    assert card["block"]["event_id"] is not None
+    assert card["block"]["next_action"] == "await adjudication"
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()
+    assert detail["task"]["body"] == "Initial Linear description"
+    assert detail["task"]["block"]["reason"] == reason
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
