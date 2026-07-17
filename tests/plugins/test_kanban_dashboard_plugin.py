@@ -177,6 +177,43 @@ def test_board_exposes_live_block_evidence_instead_of_initial_body(client):
     assert detail["task"]["block"]["reason"] == reason
 
 
+def test_board_column_entered_at_uses_status_event_not_later_activity(client):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="Exact lane timer", assignee="builder"
+        )
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Wait for an explicit decision",
+            kind="needs_input",
+        )
+        blocked_event = conn.execute(
+            "SELECT created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert blocked_event is not None
+        entered_at = int(blocked_event["created_at"])
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'commented', NULL, ?)",
+                (task_id, entered_at + 90),
+            )
+    finally:
+        conn.close()
+
+    board = client.get("/api/plugins/kanban/board").json()
+    blocked = next(c for c in board["columns"] if c["name"] == "blocked")
+    card = next(task for task in blocked["tasks"] if task["id"] == task_id)
+    assert card["column_entered_at"] == entered_at
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()
+    assert detail["task"]["column_entered_at"] == entered_at
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------

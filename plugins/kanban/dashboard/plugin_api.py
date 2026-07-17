@@ -155,12 +155,97 @@ BOARD_COLUMNS: list[str] = [
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
+# ``updated_at`` is not a lane clock: comments, heartbeats, and other
+# activity can change independently of a task's status.  The event log is the
+# durable audit source for status transitions, so derive the current lane's
+# entry time from transition events and only fall back to status-specific task
+# timestamps for legacy/pruned histories.
+_EVENT_STATUS_TARGETS: dict[str, str] = {
+    "specified": "todo",
+    "decomposed": "todo",
+    "dependency_wait": "todo",
+    "claim_rejected": "todo",
+    "promoted": "ready",
+    "promoted_manual": "ready",
+    "reclaimed": "ready",
+    "stale": "ready",
+    "timed_out": "ready",
+    "crashed": "ready",
+    "rate_limited": "ready",
+    "spawn_failed": "ready",
+    "protocol_violation": "ready",
+    "claimed": "running",
+    "blocked": "blocked",
+    "gave_up": "blocked",
+    "block_loop_detected": "escalated",
+    "legacy_block_loop_migrated": "escalated",
+    "scheduled": "scheduled",
+    "completed": "done",
+    "archived": "archived",
+}
+
+
+def _event_target_status(kind: str, payload: Any) -> Optional[str]:
+    """Return the status entered by one audit event, if it is a transition."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+    if kind in {"created", "status", "adjudication_applied"}:
+        status = payload.get("status") if isinstance(payload, dict) else None
+        return status if isinstance(status, str) and status else None
+    if kind == "unblocked":
+        status = payload.get("status") if isinstance(payload, dict) else None
+        return status if isinstance(status, str) and status else "ready"
+    return _EVENT_STATUS_TARGETS.get(kind)
+
+
+def _column_entered_at_fallback(task: kanban_db.Task) -> int:
+    if task.status == "done" and task.completed_at is not None:
+        return int(task.completed_at)
+    if task.status == "running" and task.current_run_id is not None:
+        # The board passes the exact claimed event in normal operation.  A
+        # first-start timestamp remains the safest legacy fallback when that
+        # event was pruned or imported without history.
+        if task.started_at is not None:
+            return int(task.started_at)
+    return int(task.created_at)
+
+
+def _column_entered_at_map(
+    conn, tasks: list[kanban_db.Task]
+) -> dict[str, int]:
+    """Resolve lane-entry timestamps for a whole board without N+1 queries."""
+    if not tasks:
+        return {}
+    task_by_id = {task.id: task for task in tasks}
+    resolved = {
+        task.id: _column_entered_at_fallback(task)
+        for task in tasks
+    }
+    placeholders = ",".join("?" for _ in tasks)
+    rows = conn.execute(
+        "SELECT task_id, kind, payload, created_at FROM task_events "
+        f"WHERE task_id IN ({placeholders}) ORDER BY id ASC",
+        tuple(task_by_id),
+    ).fetchall()
+    for row in rows:
+        task = task_by_id.get(row["task_id"])
+        if task is None:
+            continue
+        if _event_target_status(row["kind"], row["payload"]) == task.status:
+            resolved[task.id] = int(row["created_at"])
+    return resolved
+
+
 def _task_dict(
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
     current_run: Optional[kanban_db.Run] = None,
     latest_block_event: Optional[kanban_db.Event] = None,
+    column_entered_at: Optional[int] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
     # Add derived age metrics so the UI can colour stale cards without
@@ -175,6 +260,11 @@ def _task_dict(
     # ``tasks.result``. ``None`` when no run has produced a summary yet.
     d["latest_summary"] = latest_summary
     d["current_run"] = _run_dict(current_run) if current_run is not None else None
+    d["column_entered_at"] = int(
+        column_entered_at
+        if column_entered_at is not None
+        else _column_entered_at_fallback(task)
+    )
     block_payload = (
         latest_block_event.payload
         if latest_block_event is not None and isinstance(latest_block_event.payload, dict)
@@ -511,6 +601,7 @@ def get_board(
 
         latest_block_events: dict[str, kanban_db.Event] = {}
         task_ids = [t.id for t in tasks]
+        column_entered_at = _column_entered_at_map(conn, tasks)
         if task_ids:
             placeholders = ",".join("?" for _ in task_ids)
             block_rows = conn.execute(
@@ -555,6 +646,7 @@ def get_board(
                 latest_summary=preview,
                 current_run=current_run,
                 latest_block_event=latest_block_events.get(t.id),
+                column_entered_at=column_entered_at.get(t.id),
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
@@ -660,6 +752,7 @@ def get_task(
                 ),
                 None,
             ),
+            column_entered_at=_column_entered_at_map(conn, [task]).get(task.id),
         )
         links = _links_for(conn, task_id)
         child_ids = links["children"]
